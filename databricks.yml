@@ -1,0 +1,22 @@
+bundle:
+  name: erd-visualizer
+
+sync:
+  include:
+    - .build
+
+artifacts:
+  default:
+    build: uv run apx build
+
+resources:
+  apps:
+    erd-visualizer-app:
+      name: "erd-visualizer"
+      description: "erd-visualizer created with apx"
+      source_code_path: ./.build
+
+targets:
+  dev:
+    mode: development
+    default: true
