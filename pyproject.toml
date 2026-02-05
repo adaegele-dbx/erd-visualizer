@@ -13,7 +13,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "ty>=0.0.12",
+    "ty>=0.0.12", "apx==0.2.3",
 ]
 
 [tool.apx.metadata]
@@ -42,6 +42,17 @@ source = "uv-dynamic-versioning"
 [tool.uv-dynamic-versioning]
 vcs = "git"
 fallback-version = "0.0.0"
+
+[tool.uv]
+
+[[tool.uv.index]]
+name = "apx-index"
+url = "https://databricks-solutions.github.io/apx/simple"
+
+[tool.uv.sources]
+
+[tool.uv.sources.apx]
+index = "apx-index"
 
 [tool.hatch.build.hooks.version]
 path = "src/erd_visualizer/_version.py"

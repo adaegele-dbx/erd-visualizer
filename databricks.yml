@@ -15,6 +15,8 @@ resources:
       name: "erd-visualizer"
       description: "erd-visualizer created with apx"
       source_code_path: ./.build
+      user_api_scopes:
+        - sql
 
 targets:
   dev:
