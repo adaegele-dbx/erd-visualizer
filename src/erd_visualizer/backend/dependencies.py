@@ -41,23 +41,18 @@ RuntimeDep = Annotated[Runtime, Depends(get_runtime)]
 
 def get_obo_ws(
     token: Annotated[str | None, Header(alias="X-Forwarded-Access-Token")] = None,
+    runtime: Runtime = Depends(get_runtime),
 ) -> WorkspaceClient:
     """
-    Returns a Databricks Workspace client with authentication behalf of user.
-    If the request contains an X-Forwarded-Access-Token header, on behalf of user authentication is used.
-
-    Example usage:
-    @api.get("/items/")
-    async def read_items(obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)]):
-        # do something with the obo_ws
-        ...
+    Returns a Databricks Workspace client.
+    - If the request has a valid X-Forwarded-Access-Token (when running as a Databricks App), uses that for OBO auth.
+    - Otherwise (no token, empty, placeholder, or invalid), use runtime WorkspaceClient (e.g. local dev with databricks auth login).
     """
-
-    if not token:
-        raise ValueError(
-            "OBO token is not provided in the header X-Forwarded-Access-Token"
-        )
-
-    return WorkspaceClient(
-        token=token, auth_type="pat"
-    )  # set pat explicitly to avoid issues with SP client
+    t = (token or "").strip()
+    # Ignore placeholders / invalid tokens (e.g. proxy sending "undefined" or "***") so local dev uses runtime.ws
+    if not t or t in ("undefined", "null", "***", "*") or len(t) < 20:
+        return runtime.ws
+    try:
+        return WorkspaceClient(token=t, auth_type="pat")
+    except (ValueError, Exception):
+        return runtime.ws

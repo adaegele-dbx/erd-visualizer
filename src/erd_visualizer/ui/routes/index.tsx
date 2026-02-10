@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import Navbar from "@/components/apx/navbar";
 import {
@@ -10,7 +10,9 @@ import {
   type TableInfo,
   type RelationshipInfo,
   type ColumnInfo,
+  ApiError,
 } from "@/lib/api";
+import { ZoomIn, ZoomOut, Maximize2, RotateCcw, Search, LayoutGrid } from "lucide-react";
 
 export const Route = createFileRoute("/")({
   component: () => <Index />,
@@ -164,6 +166,7 @@ function ERDTable({
       {hasHiddenColumns && (
         <g
           transform={`translate(0, ${headerHeight + displayedColumns.length * rowHeight})`}
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
             onToggleExpand();
@@ -198,9 +201,33 @@ function ERDDiagram({ tables, relationships }: { tables: TableInfo[]; relationsh
   const HEADER_HEIGHT = 32;
   const ROW_HEIGHT = 24;
   const BUTTON_HEIGHT = 24;
-  const TABLE_GAP_X = 80;
-  const TABLE_GAP_Y = 40;
+  const TABLE_GAP_X = 50;
+  const TABLE_GAP_Y = 28;
   const COLS = Math.ceil(Math.sqrt(tables.length));
+
+  // User drag offsets from grid (dx, dy); cleared on "Reset layout"
+  const [tableOffsets, setTableOffsets] = useState<Record<string, { dx: number; dy: number }>>({});
+
+  // Zoom/pan state
+  const [scale, setScale] = useState(1);
+  const [translate, setTranslate] = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const lastPanRef = useRef({ x: 0, y: 0 });
+  const containerRef = useRef<HTMLDivElement>(null);
+  const hasFittedRef = useRef(false);
+  const dragStartRef = useRef({
+    viewportX: 0,
+    viewportY: 0,
+    tableX: 0,
+    tableY: 0,
+    gridX: 0,
+    gridY: 0,
+    scale: 1,
+    translateX: 0,
+    translateY: 0,
+  });
+
+  const [draggingTable, setDraggingTable] = useState<string | null>(null);
 
   // Track which tables are expanded
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
@@ -244,13 +271,68 @@ function ERDDiagram({ tables, relationships }: { tables: TableInfo[]; relationsh
     return table.columns.length > collapsedColumns.length;
   }, []);
 
-  // Calculate table positions based on current expanded state
+  // Zoom/pan: reset to 100%
+  const resetView = useCallback(() => {
+    setScale(1);
+    setTranslate({ x: 0, y: 0 });
+  }, []);
+
+  // Zoom toward cursor (used by wheel)
+  const zoomAt = useCallback((clientX: number, clientY: number, delta: number) => {
+    if (!containerRef.current) return;
+    const el = containerRef.current;
+    const rect = el.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    const factor = delta > 0 ? 0.9 : 1.1;
+    const newScale = Math.min(3, Math.max(0.2, scale * factor));
+    const newTx = x - (x - translate.x) * (newScale / scale);
+    const newTy = y - (y - translate.y) * (newScale / scale);
+    setScale(newScale);
+    setTranslate({ x: newTx, y: newTy });
+  }, [scale, translate]);
+
+  const onWheel = useCallback(
+    (e: React.WheelEvent) => {
+      e.preventDefault();
+      zoomAt(e.clientX, e.clientY, e.deltaY);
+    },
+    [zoomAt]
+  );
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    setIsPanning(true);
+    lastPanRef.current = { x: e.clientX - translate.x, y: e.clientY - translate.y };
+  }, [translate]);
+
+  const onMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      if (!isPanning) return;
+      setTranslate({ x: e.clientX - lastPanRef.current.x, y: e.clientY - lastPanRef.current.y });
+    },
+    [isPanning]
+  );
+
+  const onMouseUp = useCallback(() => setIsPanning(false), []);
+  const onMouseLeave = useCallback(() => setIsPanning(false), []);
+
+  // Order tables for smarter default layout: put most-referenced (many incoming FKs) toward center so related tables are closer
+  const orderedTables = useMemo(() => {
+    const refCount = new Map<string, number>();
+    tables.forEach((t) => refCount.set(t.table_name, 0));
+    relationships.forEach((r) => refCount.set(r.target_table, (refCount.get(r.target_table) ?? 0) + 1));
+    return [...tables].sort((a, b) => (refCount.get(b.table_name) ?? 0) - (refCount.get(a.table_name) ?? 0));
+  }, [tables, relationships]);
+
+  // Calculate table positions (use orderedTables for layout)
   const tablePositions = useMemo(() => {
     const positions: Record<string, { x: number; y: number; height: number }> = {};
     let maxHeightInRow = 0;
     let currentY = 20;
 
-    tables.forEach((table, index) => {
+    orderedTables.forEach((table, index) => {
       const col = index % COLS;
       const displayedColumns = getDisplayedColumns(table);
       const buttonHeight = hasHiddenColumns(table) ? BUTTON_HEIGHT : 0;
@@ -271,22 +353,135 @@ function ERDDiagram({ tables, relationships }: { tables: TableInfo[]; relationsh
     });
 
     return positions;
-  }, [tables, getDisplayedColumns, hasHiddenColumns]);
+  }, [orderedTables, getDisplayedColumns, hasHiddenColumns]);
 
-  // Calculate SVG dimensions
+  // Display positions: grid + user drag offsets (so boxes are draggable)
+  const displayPositions = useMemo(() => {
+    const out: Record<string, { x: number; y: number; height: number }> = {};
+    for (const [name, grid] of Object.entries(tablePositions)) {
+      const off = tableOffsets[name];
+      out[name] = {
+        x: grid.x + (off?.dx ?? 0),
+        y: grid.y + (off?.dy ?? 0),
+        height: grid.height,
+      };
+    }
+    return out;
+  }, [tablePositions, tableOffsets]);
+
+  // SVG viewport: include minX/minY so when tables are dragged left/up we don't get a black margin
   const svgDimensions = useMemo(() => {
-    if (Object.keys(tablePositions).length === 0) return { width: 400, height: 300 };
-    const maxX = Math.max(...Object.values(tablePositions).map((p) => p.x + TABLE_WIDTH));
-    const maxY = Math.max(...Object.values(tablePositions).map((p) => p.y + p.height));
-    return { width: maxX + 40, height: maxY + 40 };
-  }, [tablePositions]);
+    if (Object.keys(displayPositions).length === 0) return { width: 400, height: 300, minX: 0, minY: 0 };
+    const positions = Object.values(displayPositions);
+    const minX = Math.min(...positions.map((p) => p.x));
+    const minY = Math.min(...positions.map((p) => p.y));
+    const maxX = Math.max(...positions.map((p) => p.x + TABLE_WIDTH));
+    const maxY = Math.max(...positions.map((p) => p.y + p.height));
+    const padding = 40;
+    return {
+      width: maxX - minX + padding * 2,
+      height: maxY - minY + padding * 2,
+      minX,
+      minY,
+    };
+  }, [displayPositions]);
 
-  // Draw relationship lines
+  // Zoom/pan: fit to view (defined after tablePositions/svgDimensions to avoid TDZ)
+  const fitToView = useCallback(() => {
+    if (!containerRef.current || Object.keys(displayPositions).length === 0) return;
+    const el = containerRef.current;
+    const padding = 40;
+    const viewW = el.clientWidth - padding * 2;
+    const viewH = el.clientHeight - padding * 2;
+    const contentW = svgDimensions.width;
+    const contentH = svgDimensions.height;
+    const s = Math.min(viewW / contentW, viewH / contentH, 1.2);
+    setScale(s);
+    setTranslate({ x: (el.clientWidth - contentW * s) / 2, y: (el.clientHeight - contentH * s) / 2 });
+  }, [displayPositions, svgDimensions]);
+
+  // Fit to view when diagram first loads (wait for container to have real size so ERD is centered)
+  useEffect(() => {
+    if (tables.length === 0 || !containerRef.current) return;
+    const el = containerRef.current;
+    const runFit = () => {
+      if (hasFittedRef.current) return;
+      if (el.clientWidth > 0 && el.clientHeight > 0 && Object.keys(displayPositions).length > 0) {
+        hasFittedRef.current = true;
+        fitToView();
+      }
+    };
+    runFit();
+    const ro = new ResizeObserver(() => runFit());
+    ro.observe(el);
+    const t1 = setTimeout(runFit, 200);
+    const t2 = setTimeout(runFit, 500);
+    return () => {
+      ro.disconnect();
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [tables.length, displayPositions, fitToView]);
+
+  const resetLayout = useCallback(() => setTableOffsets({}), []);
+
+  const onTableMouseDown = useCallback(
+    (e: React.MouseEvent, tableName: string) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      const pos = displayPositions[tableName];
+      const grid = tablePositions[tableName];
+      if (!pos || !grid || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const viewportX = (e.clientX - rect.left - translate.x) / scale;
+      const viewportY = (e.clientY - rect.top - translate.y) / scale;
+      dragStartRef.current = {
+        viewportX,
+        viewportY,
+        tableX: pos.x,
+        tableY: pos.y,
+        gridX: grid.x,
+        gridY: grid.y,
+        scale,
+        translateX: translate.x,
+        translateY: translate.y,
+      };
+      setDraggingTable(tableName);
+    },
+    [displayPositions, tablePositions, translate, scale]
+  );
+
+  // Window-level drag: use viewport-space deltas so movement is 1:1 in all directions (minX/minY change when dragging left/up would otherwise make content-space jump)
+  useEffect(() => {
+    if (!draggingTable) return;
+    const onMove = (e: MouseEvent) => {
+      if (!containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const { viewportX, viewportY, tableX, tableY, gridX, gridY, scale: s, translateX: tx, translateY: ty } = dragStartRef.current;
+      const currentVx = (e.clientX - rect.left - tx) / s;
+      const currentVy = (e.clientY - rect.top - ty) / s;
+      const deltaX = currentVx - viewportX;
+      const deltaY = currentVy - viewportY;
+      setTableOffsets((prev) => ({
+        ...prev,
+        [draggingTable]: { dx: tableX + deltaX - gridX, dy: tableY + deltaY - gridY },
+      }));
+    };
+    const onUp = () => setDraggingTable(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [draggingTable]);
+
+  // Draw relationship lines (use display positions so lines follow dragged tables)
   const relationshipPaths = useMemo(() => {
     return relationships
       .map((rel, idx) => {
-        const sourcePos = tablePositions[rel.source_table];
-        const targetPos = tablePositions[rel.target_table];
+        const sourcePos = displayPositions[rel.source_table];
+        const targetPos = displayPositions[rel.target_table];
         if (!sourcePos || !targetPos) return null;
 
         const sourceTable = tables.find((t) => t.table_name === rel.source_table);
@@ -308,33 +503,43 @@ function ERDDiagram({ tables, relationships }: { tables: TableInfo[]; relationsh
         const sourceLeft = sourcePos.x;
         const targetRight = targetPos.x + TABLE_WIDTH;
 
+        // Orthogonal (elbowed) path: horizontal → vertical → horizontal so it's clear which fields connect
         let startX: number, endX: number;
-        let controlOffset: number;
+        let midX: number;
+        const stagger = (idx - (relationships.length - 1) / 2) * 14;
+        const elbowClearance = 30; // gap so vertical segment goes around tables, not through them
 
-        if (sourceRight < targetLeft) {
+        if (sourceRight <= targetLeft) {
+          // Source left of target: line goes right from source, vertical in gap, left to target
           startX = sourceRight;
           endX = targetLeft;
-          controlOffset = (endX - startX) / 2;
-        } else if (sourceLeft > targetRight) {
+          const baseMidX = (startX + endX) / 2;
+          midX = Math.max(startX, Math.min(endX, baseMidX + stagger));
+        } else if (sourceLeft >= targetRight) {
+          // Source right of target: line goes left from source, vertical in gap, right to target
           startX = sourceLeft;
           endX = targetRight;
-          controlOffset = (startX - endX) / 2;
+          const baseMidX = (startX + endX) / 2;
+          midX = Math.max(endX, Math.min(startX, baseMidX + stagger));
         } else {
+          // Overlapping (e.g. stacked vertically): route vertical segment to the RIGHT of both tables so the line doesn't cut through
           startX = sourceRight;
           endX = targetRight;
-          controlOffset = 40;
+          midX = Math.max(sourceRight, targetRight) + elbowClearance + stagger;
         }
-
-        const path = `M ${startX} ${sourceY} C ${startX + controlOffset} ${sourceY}, ${endX + (sourceRight < targetLeft ? -controlOffset : controlOffset)} ${targetY}, ${endX} ${targetY}`;
+        const path = `M ${startX} ${sourceY} L ${midX} ${sourceY} L ${midX} ${targetY} L ${endX} ${targetY}`;
+        const tooltip = `${rel.source_table}.${rel.source_column} → ${rel.target_table}.${rel.target_column}`;
 
         return (
-          <g key={idx}>
-            <path d={path} fill="none" stroke="var(--color-primary)" strokeWidth="2" opacity="0.6" markerEnd="url(#arrowhead)" />
+          <g key={idx} style={{ cursor: "help" }}>
+            <title>{tooltip}</title>
+            <path d={path} fill="none" stroke="var(--color-muted-foreground)" strokeWidth="1.5" opacity="0.85" markerEnd="url(#arrowhead)" />
+            <circle cx={startX} cy={sourceY} r="4" fill="var(--color-muted-foreground)" opacity="0.85" />
           </g>
         );
       })
       .filter(Boolean);
-  }, [relationships, tablePositions, tables, getDisplayedColumns]);
+  }, [relationships, displayPositions, tables, getDisplayedColumns]);
 
   if (tables.length === 0) {
     return (
@@ -345,44 +550,115 @@ function ERDDiagram({ tables, relationships }: { tables: TableInfo[]; relationsh
   }
 
   return (
-    <div className="w-full h-full overflow-auto flex items-center justify-center bg-muted/30 rounded-lg">
-      <svg width={svgDimensions.width} height={svgDimensions.height} style={{ minWidth: svgDimensions.width, minHeight: svgDimensions.height }}>
-        <defs>
-          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-            <polygon points="0 0, 10 3.5, 0 7" fill="var(--color-primary)" opacity="0.6" />
-          </marker>
-        </defs>
+    <div className="w-full h-full flex flex-col bg-muted/30 rounded-lg overflow-hidden">
+      {/* Diagram toolbar */}
+      <div className="flex items-center gap-1 p-2 border-b bg-card/80 shrink-0">
+        <button
+          type="button"
+          onClick={fitToView}
+          className="p-1.5 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+          title="Fit to view"
+        >
+          <Maximize2 className="h-4 w-4" />
+        </button>
+        <button
+          type="button"
+          onClick={resetView}
+          className="p-1.5 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+          title="Reset zoom (100%)"
+        >
+          <RotateCcw className="h-4 w-4" />
+        </button>
+        <button
+          type="button"
+          onClick={() => zoomAt(0, 0, 1)}
+          className="p-1.5 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+          title="Zoom in"
+        >
+          <ZoomIn className="h-4 w-4" />
+        </button>
+        <button
+          type="button"
+          onClick={() => zoomAt(0, 0, -1)}
+          className="p-1.5 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+          title="Zoom out"
+        >
+          <ZoomOut className="h-4 w-4" />
+        </button>
+        <span className="ml-2 text-xs text-muted-foreground tabular-nums">{Math.round(scale * 100)}%</span>
+        <button
+          type="button"
+          onClick={resetLayout}
+          className="ml-2 p-1.5 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+          title="Reset layout (snap tables back to grid)"
+        >
+          <LayoutGrid className="h-4 w-4" />
+        </button>
+      </div>
 
-        {/* Relationship lines */}
-        {relationshipPaths}
+      {/* Pannable/zoomable diagram area */}
+      <div
+        ref={containerRef}
+        className={`flex-1 overflow-hidden flex items-center justify-center select-none ${draggingTable ? "cursor-grabbing" : "cursor-grab active:cursor-grabbing"}`}
+        onWheel={onWheel}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={onMouseUp}
+        onMouseLeave={onMouseLeave}
+        style={{ touchAction: "none" }}
+      >
+        <div
+          style={{
+            transform: `translate(${translate.x}px, ${translate.y}px) scale(${scale})`,
+            transformOrigin: "0 0",
+          }}
+        >
+          <svg width={svgDimensions.width} height={svgDimensions.height} style={{ minWidth: svgDimensions.width, minHeight: svgDimensions.height }}>
+            <defs>
+              {/* Traditional ERD: small open arrow (stroke only), not a big filled triangle */}
+              <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="6" refY="3" orient="auto">
+                <path d="M 0 0 L 6 3 L 0 6" fill="none" stroke="var(--color-muted-foreground)" strokeWidth="1.5" strokeLinejoin="round" opacity="0.85" />
+              </marker>
+            </defs>
+            <g transform={`translate(${40 - (svgDimensions.minX ?? 0)}, ${40 - (svgDimensions.minY ?? 0)})`}>
+              {/* Tables first so relationship lines draw on top (arrows stay visible, not hidden behind boxes) */}
+              {tables.map((table) => {
+              const pos = displayPositions[table.table_name];
+              if (!pos) return null;
 
-        {/* Tables */}
-        {tables.map((table) => {
-          const pos = tablePositions[table.table_name];
-          if (!pos) return null;
+              return (
+                <g
+                  key={table.table_name}
+                  onMouseDown={(e) => onTableMouseDown(e, table.table_name)}
+                  style={{ cursor: draggingTable === table.table_name ? "grabbing" : "move" }}
+                >
+                  <ERDTable
+                    table={table}
+                    x={pos.x}
+                    y={pos.y}
+                    tableWidth={TABLE_WIDTH}
+                    headerHeight={HEADER_HEIGHT}
+                    rowHeight={ROW_HEIGHT}
+                    expanded={expandedTables.has(table.table_name)}
+                    onToggleExpand={() => toggleTableExpand(table.table_name)}
+                  />
+                </g>
+              );
+            })}
 
-          return (
-            <ERDTable
-              key={table.table_name}
-              table={table}
-              x={pos.x}
-              y={pos.y}
-              tableWidth={TABLE_WIDTH}
-              headerHeight={HEADER_HEIGHT}
-              rowHeight={ROW_HEIGHT}
-              expanded={expandedTables.has(table.table_name)}
-              onToggleExpand={() => toggleTableExpand(table.table_name)}
-            />
-          );
-        })}
-      </svg>
+              {/* Relationship lines on top so they're never hidden behind table boxes */}
+              {relationshipPaths}
+            </g>
+          </svg>
+        </div>
+      </div>
     </div>
   );
 }
 
 // ERD View Component
 function ERDView({ catalogName, schemaName, onBack }: { catalogName: string; schemaName: string; onBack: () => void }) {
-  const { data, isLoading, error } = useGetSchemaERD({
+  const { data, isLoading, error, isFetching } = useGetSchemaERD({
     params: { catalog_name: catalogName, schema_name: schemaName },
   });
   const [showErrorModal, setShowErrorModal] = useState(false);
@@ -390,15 +666,20 @@ function ERDView({ catalogName, schemaName, onBack }: { catalogName: string; sch
   useEffect(() => {
     if (error) {
       setShowErrorModal(true);
+    } else {
+      setShowErrorModal(false);
     }
   }, [error]);
+
+  // Show loading when fetching (covers initial load and refetch when switching schema)
+  const showLoading = isLoading || (isFetching && !data);
 
   const handleCloseModal = () => {
     setShowErrorModal(false);
     onBack();
   };
 
-  if (isLoading) {
+  if (showLoading) {
     return (
       <div className="flex-1 flex items-center justify-center">
         <div className="animate-spin h-8 w-8 border-2 border-primary border-t-transparent rounded-full" />
@@ -411,14 +692,22 @@ function ERDView({ catalogName, schemaName, onBack }: { catalogName: string; sch
     <>
       <ErrorModal isOpen={showErrorModal} onClose={handleCloseModal} title="Failed to load ERD" message={error?.message || "Unable to load schema information."} />
       <div className="flex-1 flex flex-col overflow-hidden">
-        <div className="flex items-center gap-4 p-4 border-b">
-          <h2 className="text-lg font-semibold">
-            {catalogName}.{schemaName}
-          </h2>
+        <div className="flex items-center gap-4 p-4 border-b shrink-0">
+          <nav className="flex items-center gap-2 text-sm">
+            <button
+              type="button"
+              onClick={onBack}
+              className="text-muted-foreground hover:text-foreground transition-colors font-medium"
+            >
+              {catalogName}
+            </button>
+            <span className="text-muted-foreground">/</span>
+            <span className="font-semibold text-foreground">{schemaName}</span>
+          </nav>
           <span className="text-sm text-muted-foreground">{data?.data.tables.length ?? 0} tables</span>
         </div>
         <div className="flex-1 p-4 overflow-hidden">
-          <ERDDiagram tables={data?.data.tables ?? []} relationships={data?.data.relationships ?? []} />
+          <ERDDiagram key={`${catalogName}.${schemaName}`} tables={data?.data.tables ?? []} relationships={data?.data.relationships ?? []} />
         </div>
       </div>
     </>
@@ -462,6 +751,16 @@ function Sidebar({
   const catalogs = catalogsData?.data.catalogs ?? [];
   const schemas = schemasData?.data.schemas ?? [];
 
+  const [searchQuery, setSearchQuery] = useState("");
+  const filteredCatalogs = useMemo(
+    () => catalogs.filter((c) => c.name.toLowerCase().includes(searchQuery.trim().toLowerCase())),
+    [catalogs, searchQuery]
+  );
+  const filteredSchemas = useMemo(
+    () => schemas.filter((s) => s.name.toLowerCase().includes(searchQuery.trim().toLowerCase())),
+    [schemas, searchQuery]
+  );
+
   return (
     <>
       <ErrorModal isOpen={showErrorModal} onClose={handleCloseModal} title="Failed to load schemas" message={errorMessage} />
@@ -482,8 +781,22 @@ function Sidebar({
           )}
         </div>
 
+        {/* Search */}
+        <div className="px-2 pb-2">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
+            <input
+              type="text"
+              placeholder={selectedCatalog ? "Filter schemas…" : "Filter catalogs…"}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-8 pr-2 py-1.5 text-sm rounded-md border bg-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+        </div>
+
         {/* List */}
-        <div className="flex-1 overflow-y-auto p-2">
+        <div className="flex-1 overflow-y-auto p-2 pt-0">
           {!selectedCatalog ? (
             // Catalog list
             catalogsLoading ? (
@@ -491,15 +804,32 @@ function Sidebar({
                 <div className="animate-spin h-4 w-4 border-2 border-primary border-t-transparent rounded-full" />
               </div>
             ) : catalogsError ? (
-              <div className="p-2 text-sm text-destructive">Failed to load catalogs</div>
-            ) : catalogs.length === 0 ? (
-              <div className="p-2 text-sm text-muted-foreground">No catalogs found</div>
+              <div className="p-2 text-sm text-destructive space-y-1">
+                <div>Failed to load catalogs</div>
+                {catalogsError instanceof ApiError &&
+                  typeof catalogsError.body === "object" &&
+                  catalogsError.body !== null &&
+                  "detail" in catalogsError.body && (
+                    <div className="text-muted-foreground font-normal text-xs mt-1">
+                      {typeof (catalogsError.body as { detail: unknown }).detail === "string"
+                        ? (catalogsError.body as { detail: string }).detail
+                        : JSON.stringify((catalogsError.body as { detail: unknown }).detail)}
+                    </div>
+                  )}
+              </div>
+            ) : filteredCatalogs.length === 0 ? (
+              <div className="p-2 text-sm text-muted-foreground">
+                {searchQuery.trim() ? "No matching catalogs" : "No catalogs found"}
+              </div>
             ) : (
               <ul className="space-y-1">
-                {catalogs.map((catalog) => (
+                {filteredCatalogs.map((catalog) => (
                   <li
                     key={catalog.name}
-                    onClick={() => onSelectCatalog(catalog)}
+                    onClick={() => {
+                      setSearchQuery("");
+                      onSelectCatalog(catalog);
+                    }}
                     className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-accent cursor-pointer text-sm group"
                   >
                     <DatabaseIcon className="h-3.5 w-3.5 text-muted-foreground" />
@@ -520,11 +850,13 @@ function Sidebar({
                 <div className="flex items-center justify-center py-4">
                   <div className="animate-spin h-4 w-4 border-2 border-primary border-t-transparent rounded-full" />
                 </div>
-              ) : schemas.length === 0 ? (
-                <div className="p-2 text-sm text-muted-foreground">No schemas found</div>
+              ) : filteredSchemas.length === 0 ? (
+                <div className="p-2 text-sm text-muted-foreground">
+                  {searchQuery.trim() ? "No matching schemas" : "No schemas found"}
+                </div>
               ) : (
                 <ul className="space-y-1">
-                  {schemas.map((schema) => (
+                  {filteredSchemas.map((schema) => (
                     <li
                       key={schema.name}
                       onClick={() => onSelectSchema(schema)}
@@ -568,11 +900,6 @@ function Index() {
     }
   }, [selectedSchema]);
 
-  const handleBackToCatalogs = useCallback(() => {
-    setSelectedCatalog(null);
-    setSelectedSchema(null);
-  }, []);
-
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-background">
       <Navbar />
@@ -584,7 +911,7 @@ function Index() {
           selectedSchema={selectedSchema}
           onSelectCatalog={handleSelectCatalog}
           onSelectSchema={handleSelectSchema}
-          onBack={handleBackToCatalogs}
+          onBack={handleBack}
         />
 
         {/* Main Content */}
@@ -604,7 +931,12 @@ function Index() {
               </div>
             </div>
           ) : selectedCatalog && selectedSchema ? (
-            <ERDView catalogName={selectedCatalog.name} schemaName={selectedSchema.name} onBack={handleBack} />
+            <ERDView
+              key={`${selectedCatalog.name}.${selectedSchema.name}`}
+              catalogName={selectedCatalog.name}
+              schemaName={selectedSchema.name}
+              onBack={handleBack}
+            />
           ) : null}
         </main>
       </div>

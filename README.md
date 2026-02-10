@@ -23,6 +23,15 @@ uv run apx dev start
 This will start an apx development server, which in it's turn runs backend, frontend and OpenAPI watcher. 
 All servers run in the background, with logs kept in-memory of the apx dev server.
 
+**Local authentication:** When running locally, the app uses your Databricks credentials (no `X-Forwarded-Access-Token` required). Configure one of:
+
+- **`databricks auth login`** – then use that profile (e.g. `DATABRICKS_CONFIG_PROFILE=your-profile`)
+- **`.env`** – set `DATABRICKS_HOST` and `DATABRICKS_TOKEN` (or `DATABRICKS_ACCESS_TOKEN`) in the project root
+
+Then open the frontend (e.g. http://localhost:5173) and use the app. When deployed as a Databricks App, the platform injects the access token for each user.
+
+**SQL warehouse:** Listing catalogs/schemas and building the ERD runs SQL via a warehouse. Ensure your workspace has at least one SQL warehouse (can be stopped when not in use). If you see "No SQL warehouse available", create one in the Databricks SQL workspace.
+
 ### 📊 Monitoring & Logs
 
 ```bash
